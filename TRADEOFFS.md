@@ -6,7 +6,7 @@ These are the decisions I made while building this and why. Some were obvious, s
 
 ## Language and Framework
 
-**Python + FastAPI** over Node.js + Express (which I built first).
+**Python + FastAPI**.
 
 FastAPI gives you auto-generated Swagger docs for free, async support out of the box, and Pydantic for request validation. I like that you define the input schema once and it handles validation, docs, and type checking all together.
 
