@@ -1,0 +1,110 @@
+{
+  "workflowId": "loan_approval",
+  "name": "Loan Approval Workflow",
+  "description": "Evaluates loan applications based on credit score, income, loan amount, and employment status.",
+  "version": "1.0.0",
+  "inputSchema": {
+    "type": "object",
+    "required": ["applicant_name", "credit_score", "annual_income", "loan_amount", "employment_status"],
+    "properties": {
+      "applicant_name": { "type": "string", "minLength": 1 },
+      "credit_score": { "type": "number", "minimum": 300, "maximum": 850 },
+      "annual_income": { "type": "number", "minimum": 0 },
+      "loan_amount": { "type": "number", "minimum": 1000 },
+      "employment_status": { "type": "string", "enum": ["employed", "self_employed", "unemployed", "retired"] },
+      "years_employed": { "type": "number", "minimum": 0 },
+      "existing_debt": { "type": "number", "minimum": 0 },
+      "collateral_value": { "type": "number", "minimum": 0 }
+    },
+    "additionalProperties": true
+  },
+  "stages": [
+    {
+      "name": "field_validation",
+      "type": "validation",
+      "rules": [
+        { "type": "required", "field": "applicant_name" },
+        { "type": "required", "field": "credit_score" },
+        { "type": "required", "field": "annual_income" },
+        { "type": "required", "field": "loan_amount" },
+        { "type": "type_check", "field": "credit_score", "expectedType": "number" },
+        { "type": "type_check", "field": "annual_income", "expectedType": "number" }
+      ]
+    },
+    {
+      "name": "credit_check",
+      "type": "external_call",
+      "service": "credit_bureau",
+      "required": true,
+      "retryPolicy": {
+        "maxRetries": 3,
+        "backoffMs": 200
+      }
+    },
+    {
+      "name": "employment_check",
+      "type": "rule_evaluation",
+      "stopOnReject": false,
+      "rules": [
+        {
+          "name": "Employment Status Check",
+          "field": "employment_status",
+          "operator": "!=",
+          "value": "unemployed",
+          "mandatory": true,
+          "failOutcome": "REJECTED",
+          "outcome": null
+        }
+      ]
+    },
+    {
+      "name": "credit_evaluation",
+      "type": "rule_evaluation",
+      "stopOnReject": true,
+      "rules": [
+        {
+          "name": "Poor Credit - Auto Reject",
+          "field": "credit_score",
+          "operator": "<",
+          "value": 550,
+          "outcome": "REJECTED"
+        },
+        {
+          "name": "Excellent Credit - Auto Approve",
+          "field": "credit_score",
+          "operator": ">=",
+          "value": 750,
+          "outcome": "APPROVED"
+        },
+        {
+          "name": "Moderate Credit - Manual Review",
+          "field": "credit_score",
+          "operator": "range",
+          "min": 550,
+          "max": 749,
+          "outcome": "MANUAL_REVIEW"
+        }
+      ]
+    },
+    {
+      "name": "loan_amount_check",
+      "type": "rule_evaluation",
+      "rules": [
+        {
+          "name": "Maximum Loan Amount",
+          "field": "loan_amount",
+          "operator": "<=",
+          "value": 500000,
+          "mandatory": true,
+          "failOutcome": "REJECTED",
+          "outcome": null
+        }
+      ]
+    },
+    {
+      "name": "final_decision",
+      "type": "decision",
+      "outcomes": ["APPROVED", "REJECTED", "MANUAL_REVIEW"]
+    }
+  ]
+}

@@ -1,0 +1,122 @@
+{
+  "workflowId": "vendor_approval",
+  "name": "Vendor Approval Workflow",
+  "description": "Evaluates vendor registration applications based on compliance, financial standing, and documentation.",
+  "version": "1.0.0",
+  "inputSchema": {
+    "type": "object",
+    "required": ["company_name", "registration_number", "annual_revenue", "years_in_business", "country"],
+    "properties": {
+      "company_name": { "type": "string", "minLength": 1 },
+      "registration_number": { "type": "string", "minLength": 1 },
+      "annual_revenue": { "type": "number", "minimum": 0 },
+      "years_in_business": { "type": "number", "minimum": 0 },
+      "country": { "type": "string" },
+      "has_insurance": { "type": "boolean" },
+      "certifications": { "type": "array", "items": { "type": "string" } },
+      "tax_compliant": { "type": "boolean" }
+    },
+    "additionalProperties": true
+  },
+  "stages": [
+    {
+      "name": "document_validation",
+      "type": "validation",
+      "rules": [
+        { "type": "required", "field": "company_name" },
+        { "type": "required", "field": "registration_number" },
+        { "type": "required", "field": "annual_revenue" },
+        { "type": "required", "field": "country" }
+      ]
+    },
+    {
+      "name": "compliance_verification",
+      "type": "external_call",
+      "service": "compliance_check",
+      "required": true,
+      "retryPolicy": {
+        "maxRetries": 3,
+        "backoffMs": 300
+      }
+    },
+    {
+      "name": "identity_check",
+      "type": "external_call",
+      "service": "identity_verification",
+      "required": false,
+      "retryPolicy": {
+        "maxRetries": 2,
+        "backoffMs": 200
+      }
+    },
+    {
+      "name": "business_viability",
+      "type": "rule_evaluation",
+      "stopOnReject": true,
+      "rules": [
+        {
+          "name": "Minimum Years in Business",
+          "field": "years_in_business",
+          "operator": ">=",
+          "value": 2,
+          "mandatory": true,
+          "failOutcome": "REJECTED",
+          "outcome": null
+        },
+        {
+          "name": "Minimum Revenue",
+          "field": "annual_revenue",
+          "operator": ">=",
+          "value": 100000,
+          "mandatory": true,
+          "failOutcome": "REJECTED",
+          "outcome": null
+        },
+        {
+          "name": "Established Business",
+          "field": "years_in_business",
+          "operator": ">=",
+          "value": 5,
+          "outcome": "APPROVED"
+        },
+        {
+          "name": "New Business - Review",
+          "field": "years_in_business",
+          "operator": "range",
+          "min": 2,
+          "max": 4,
+          "outcome": "MANUAL_REVIEW"
+        }
+      ]
+    },
+    {
+      "name": "sanctions_check",
+      "type": "rule_evaluation",
+      "rules": [
+        {
+          "name": "Country Sanctions Check",
+          "field": "country",
+          "operator": "not_in",
+          "value": ["SANCTIONED_COUNTRY_A", "SANCTIONED_COUNTRY_B"],
+          "mandatory": true,
+          "failOutcome": "REJECTED",
+          "outcome": null
+        },
+        {
+          "name": "Tax Compliance Check",
+          "field": "tax_compliant",
+          "operator": "==",
+          "value": true,
+          "mandatory": true,
+          "failOutcome": "MANUAL_REVIEW",
+          "outcome": "APPROVED"
+        }
+      ]
+    },
+    {
+      "name": "final_decision",
+      "type": "decision",
+      "outcomes": ["APPROVED", "REJECTED", "MANUAL_REVIEW"]
+    }
+  ]
+}
