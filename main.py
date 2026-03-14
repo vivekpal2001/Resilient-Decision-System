@@ -22,6 +22,7 @@ class WorkflowRequest(BaseModel):
 
 class RecoverRequest(BaseModel):
     max_age_minutes: int = 5
+    retry: bool = False
 
 
 config_loader = ConfigLoader()
@@ -41,17 +42,23 @@ async def lifespan(app: FastAPI):
     audit_logger = AuditLogger(db)
     workflow_engine = WorkflowEngine(config_loader, state_machine, audit_logger)
 
+    # load API-registered workflows from DB
+    await config_loader.load_from_db(db)
+
     workflows = config_loader.get_all_workflows()
     print(f"Loaded {len(workflows)} workflow(s):")
     for w in workflows:
         print(f"  - {w['workflowId']}: {w['name']} ({len(w['stages'])} stages)")
 
-    # recover any requests that got stuck from a previous crash
-    recovered = await recover_stale_requests(db, 5)
+    # recover stuck requests with retry (re-process instead of just marking FAILED)
+    recovered = await recover_stale_requests(db, 5, retry=True, workflow_engine=workflow_engine)
     if recovered:
         print(f"\n⚠️  Recovered {len(recovered)} stale request(s):")
         for r in recovered:
-            print(f"  - {r['id']}: was stuck in '{r['status']}' → marked FAILED")
+            if r.get('retried'):
+                print(f"  - {r['id']}: retried → {r.get('retry_outcome', 'unknown')}")
+            else:
+                print(f"  - {r['id']}: was stuck in '{r['status']}' → marked FAILED")
 
     print(f"\n🚀 Resilient Decision System running")
     print(f"📚 API docs: http://localhost:8000/docs")
@@ -217,25 +224,36 @@ async def get_workflow(workflow_id: str):
 @app.post("/api/workflows", status_code=201)
 async def register_workflow(config: dict):
     try:
-        registered = config_loader.register_workflow(config)
-        return {"success": True, "message": f"Workflow '{registered['workflowId']}' registered", "workflow": registered}
+        registered = await config_loader.register_workflow(config)
+        return {
+            "success": True,
+            "message": f"Workflow '{registered['workflowId']}' registered and persisted to DB",
+            "workflow": registered,
+            "persisted": True,
+        }
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.post("/api/recover")
 async def recover(req: RecoverRequest):
-    recovered = await recover_stale_requests(db, req.max_age_minutes)
+    recovered = await recover_stale_requests(
+        db, req.max_age_minutes,
+        retry=req.retry,
+        workflow_engine=workflow_engine if req.retry else None
+    )
     return {
         "success": True,
         "recovered_count": len(recovered),
+        "mode": "retry" if req.retry else "mark_failed",
         "recovered_requests": [{
             "id": r['id'],
             "previous_state": r['status'],
-            "new_state": "FAILED",
-            "reason": f"Auto-recovered: stuck in '{r['status']}' for over {req.max_age_minutes} min",
+            "retried": r.get('retried', False),
+            "new_outcome": r.get('retry_outcome', 'FAILED'),
+            "reason": f"Retried from '{r['status']}'" if r.get('retried') else f"Marked FAILED from '{r['status']}'",
         } for r in recovered],
-        "message": f"Recovered {len(recovered)} stale request(s)." if recovered else "No stale requests found.",
+        "message": f"Recovered {len(recovered)} request(s) ({'retried' if req.retry else 'marked failed'})." if recovered else "No stale requests found.",
     }
 
 

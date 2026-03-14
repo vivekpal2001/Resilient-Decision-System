@@ -1,89 +1,110 @@
-# Technical Tradeoffs
+# Technical Decisions and Tradeoffs
 
-## Why Python + FastAPI
+These are the decisions I made while building this and why. Some were obvious, some took more thought.
 
-| Consideration | Choice | Reasoning |
-|---------------|--------|-----------|
-| Language | Python over Node.js | Type hints via Pydantic, better readability for decision logic, native async support |
-| Framework | FastAPI over Flask/Django | Auto-generated OpenAPI docs, async-first, request validation baked in |
-| Database | SQLite over Postgres | Zero setup, single-file DB, good enough for this workload. Easy to swap later |
-| ORM | Raw SQL over SQLAlchemy | Fewer abstractions, full control over queries, simpler debugging |
-| Testing | pytest over unittest | Async fixtures, cleaner syntax, better assertion introspection |
+---
 
-## Architecture Decisions
+## Language and Framework
 
-### 1. Single-file API (`main.py`) vs Router Split
+**Python + FastAPI** over Node.js + Express (which I built first).
 
-**Chose:** Single file with all routes.
+FastAPI gives you auto-generated Swagger docs for free, async support out of the box, and Pydantic for request validation. I like that you define the input schema once and it handles validation, docs, and type checking all together.
 
-**Why:** ~10 routes total. Splitting into separate router files adds complexity without benefit at this scale. If this grows past 20+ routes, use `APIRouter` and split by domain (requests, workflows, admin).
+Flask was an option but it's not async-first, and Django felt like overkill for an API-only project with no ORM needed.
 
-### 2. In-memory Idempotency vs DB-backed
+---
 
-**Chose:** In-memory dictionary.
+## Database: SQLite
 
-**Why:** Simpler, faster lookups. Tradeoff is that keys are lost on restart. The `idempotency_keys` table exists in the schema for future migration to DB-backed if persistence matters.
+I picked SQLite mostly for simplicity. No separate process to run, no connection strings to configure, just a file. For the load this system will see in a hackathon/demo setting, it's more than enough.
 
-### 3. External Service Simulation vs Real Calls
-
-**Chose:** Simulated services with configurable failure/latency.
-
-**Why:** No real external APIs to call — simulation lets us test retry logic, failure handling, and latency without network dependencies. Each service has tunable `failureRate` and `latencyMs`.
-
-### 4. SQLite vs Postgres
-
-**Chose:** SQLite.
-
-**Pros:**
-- Zero config, embedded in the app
-- Works offline, no separate process
-- Good for ~1000 req/sec at this data size
-
-**Cons:**
-- No concurrent writes (WAL mode helps but has limits)
-- No JSON column type (we store JSON as TEXT)
+**What I'd lose at scale:**
+- No concurrent writes (SQLite has one writer at a time)
+- No native JSON column type (I store JSON as TEXT)
 - Single-node only
 
-**Migration path:** Swap `aiosqlite` for `asyncpg`, update SQL syntax (mainly datetime functions), everything else stays the same.
+**Migration path:** Swap `aiosqlite` for `asyncpg`, update datetime SQL syntax, and everything else stays the same. The DB layer is isolated in `db/database.py`.
 
-### 5. Workflow Config as JSON Files vs DB
+---
 
-**Chose:** JSON files loaded at startup + runtime API registration.
+## Raw SQL vs ORM (SQLAlchemy)
 
-**Why:** Workflows change infrequently. Files are version-controllable (git), easy to review in PRs, and don't need a DB migration to update. Runtime registration via API handles dynamic use cases.
+I went with raw SQL. The queries are simple — inserts, selects, updates. Using an ORM here would add a layer of abstraction without much benefit. Also makes debugging easier — I can just log the SQL and immediately see what's happening.
 
-**Tradeoff:** API-registered workflows are in-memory only — lost on restart. Could persist to DB if needed.
+---
 
-### 6. Synchronous Processing vs Queue-based
+## All Routes in `main.py`
 
-**Chose:** Synchronous (process request inline, return result).
+I put all 10 routes in one file. For this many routes, splitting into separate files would add complexity without benefit. If this grew to 30+ routes, I'd use `APIRouter` and split by domain (requests/, workflows/, admin/).
 
-**Why:** Decision latency is < 1 second even with external call retries. Queue-based (Celery, RQ) adds operational complexity for no real gain here.
+---
 
-**When to switch:** If external calls take > 5 seconds or you need to handle 100+ concurrent requests, move to a task queue with webhook callbacks.
+## Idempotency: In-Memory Dict
 
-### 7. Recovery Strategy
+Idempotency keys are stored in a Python dict in memory. Fast lookup, zero DB queries. The downside is they're lost on server restart — send the same key after a restart and it'll be processed again.
 
-**Chose:** Time-based stale request detection.
+The `idempotency_keys` DB table exists in the schema for a future migration if persistence matters. Wiring it up would take maybe 20 lines of code.
 
-**How:** On startup (and via API), find requests stuck in non-terminal states for > 5 minutes and mark as FAILED.
+---
 
-**Alternative considered:** Transaction-based (wrap entire workflow in a DB transaction). Rejected because external calls can't be rolled back — if we call credit_bureau and then crash, we can't "undo" that call. Better to detect and recover.
+## Workflow Configs: JSON Files + DB
 
-### 8. Rule Engine Design
+Built-in workflows (`loan_approval`, `vendor_approval`) are JSON files in `config/workflows/`. They load on startup, they're version-controlled in git, and changing them is just editing a file.
 
-**Chose:** Lambda-based operator map with human-readable reasoning.
+But if someone registers a workflow via `POST /api/workflows`, that needs to survive restarts too. So I added a `workflows` table in SQLite. On startup, the config loader first reads JSON files, then loads DB-registered workflows. Both go into the same in-memory dict.
 
-**Why:** Adding a new operator = adding one lambda. Each rule evaluation produces a reasoning string that explains *why* it passed/failed in plain English. This makes debugging and auditing much easier vs opaque true/false results.
+This hybrid approach works well — files for stability, DB for flexibility.
 
-**Tradeoff:** The reasoning generation code is verbose (~40 lines of string formatting). Worth it for auditability.
+---
 
-## What I'd Change in Production
+## External Services: Simulated
 
-1. **DB:** Switch to Postgres for concurrent writes and proper JSON columns
-2. **Idempotency:** Move to DB-backed with TTL expiration
-3. **Auth:** Add JWT or API key authentication
-4. **Rate limiting:** Add per-client rate limits
-5. **Monitoring:** Add structured logging (JSON), health metrics, request tracing
-6. **Config:** Store workflows in DB with versioning, keep JSON files as seed data
-7. **Queue:** Add Celery/RQ for workflows with slow external calls
+The credit bureau, identity check, compliance check — they're all simulated with configurable failure rates and latency. This isn't ideal for production but it lets me test retry logic, failure handling, and latency behavior without depending on real APIs.
+
+Each service has a `failureRate` (0.05 to 0.15) and a `latencyMs`. The retry logic uses exponential backoff: 200ms → 400ms → 800ms.
+
+---
+
+## Recovery: Retry vs Mark-Failed
+
+When the server crashes mid-request, the request is stuck in a non-terminal state in the DB. On the next startup, `recover_stale_requests()` finds these and handles them.
+
+I have two modes:
+- **Retry** (default on startup): Re-run the request through the workflow engine from scratch
+- **Mark-failed**: Just stamp it as FAILED
+
+I chose retry-from-scratch over resume-from-stage because resume would require tracking which stages completed and which didn't — more state, more complexity. Starting fresh is simpler and gives a consistent result.
+
+One tradeoff: if a request crashed after calling the credit bureau, retry will call it again. I accepted this because the external calls are idempotent by design in this system.
+
+---
+
+## Synchronous Processing
+
+Requests are processed inline — client sends request, waits for result, gets it back. No queues, no webhooks.
+
+This works because the full workflow (including external calls with retries) takes under 2 seconds. If external calls regularly took 10+ seconds, I'd switch to async processing with a task queue (Celery or RQ) and a webhook callback.
+
+---
+
+## Rule Engine Design
+
+The rule engine is a dict of lambdas — one per operator. Adding a new operator is literally one line:
+
+```python
+'starts_with': lambda v, t, _: str(v).startswith(t),
+```
+
+Each rule evaluation produces a human-readable reasoning string like "✓ credit_score is 780, meets minimum of 750 → APPROVED". This makes the audit trail actually readable instead of just true/false values.
+
+---
+
+## What I'd Do Differently in Production
+
+1. Postgres instead of SQLite (concurrent writes, JSON columns)
+2. DB-backed idempotency with TTL
+3. JWT or API key auth
+4. Rate limiting per client
+5. Structured JSON logging + distributed tracing
+6. Celery/RQ for long-running workflows
+7. Stage-level resume in recovery (skip stages that already completed)

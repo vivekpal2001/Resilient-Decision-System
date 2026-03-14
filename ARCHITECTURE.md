@@ -1,94 +1,125 @@
 # System Architecture
 
-## Overview
+## What This System Does
 
-The system is a configurable decision engine that processes requests through a series of stages defined in JSON workflow configs. It validates input, calls external services, evaluates rules, and produces a final decision with a human-readable explanation.
+At a high level — a request comes in, the system pulls the right workflow config (a JSON file), runs it through a series of stages (validation → external API calls → rule evaluation), and produces a final decision like APPROVED, REJECTED, or MANUAL_REVIEW.
 
-## High-Level Flow
+Every step is tracked. Every rule evaluation is logged. If the server crashes mid-request, it recovers automatically on next startup.
 
-```
-Client Request
-     │
-     ▼
-┌──────────┐
-│ FastAPI   │  ← idempotency check, input parsing
-│ (main.py) │
-└────┬─────┘
-     │
-     ▼
-┌──────────────────┐
-│ Workflow Engine   │  ← loads config, runs stages in sequence
-└────┬─────────────┘
-     │
-     ├──→ Validation Stage     → checks required fields + types
-     ├──→ External Call Stage  → calls service simulator w/ retry
-     ├──→ Rule Evaluation Stage → runs rules through rule engine
-     └──→ Decision Stage       → placeholder (handled by decision maker)
-     │
-     ▼
-┌──────────────────┐
-│ Decision Maker   │  ← collects stage outcomes, picks final result
-└────┬─────────────┘    REJECTED > MANUAL_REVIEW > APPROVED
-     │
-     ▼
-  Response (with full explanation)
-```
+---
 
-## Module Breakdown
-
-### API Layer (`main.py`)
-FastAPI app. Handles routing, idempotency (in-memory dict), request logging middleware. All routes live here for simplicity.
-
-### Workflow Engine (`engine/workflow_engine.py`)
-Core orchestrator. Takes a request + workflow config, runs each stage sequentially. Manages state transitions and audit logging at every step. If a required stage fails, it short-circuits.
-
-### Rule Engine (`engine/rule_engine.py`)
-Evaluates a list of rules against input data. Supports 12 operators (>=, <=, range, regex, etc). Each rule produces a human-readable reasoning string with ✓/✗/· indicators. Mandatory rules can halt evaluation early.
-
-### Decision Maker (`engine/decision_maker.py`)
-Takes all stage results and determines the final outcome using priority ordering. Also generates the full decision report text.
-
-### State Machine (`state/__init__.py`)
-Enforces valid lifecycle transitions (RECEIVED → VALIDATING → EVALUATING → DECIDED → COMPLETED). Invalid transitions raise errors. Every transition is persisted to `state_history` table.
-
-### Audit Logger (`audit/__init__.py`)
-Records every event: state changes, rule evaluations, external calls, errors, final decisions. Stored in `audit_logs` table with JSON snapshots of inputs/outputs.
-
-### External Service Simulator (`external/__init__.py`)
-Simulates external API calls (credit bureau, identity verification, etc) with configurable latency and failure rates. Includes retry with exponential backoff.
-
-### Config Loader (`config/config_loader.py`)
-Loads workflow JSON files from `config/workflows/` on startup. Also supports runtime registration via API.
-
-### Database (`db/database.py`)
-Async SQLite via aiosqlite. Runs schema migrations on startup. Includes `recover_stale_requests()` to handle crash recovery — finds requests stuck in non-terminal states and marks them as FAILED.
-
-## Database Schema
+## How a Request Flows Through the System
 
 ```
-requests          ← main table: id, workflow_id, input_data, status, outcome
-state_history     ← every state transition with from/to/reason
-audit_logs        ← all events: rules, external calls, errors, decisions
-idempotency_keys  ← reserved for DB-backed idempotency (currently in-memory)
+Client
+  │
+  │  POST /api/requests
+  ▼
+FastAPI (main.py)
+  │  ← checks idempotency key
+  │  ← creates request record in DB (status: RECEIVED)
+  │  ← logs REQUEST_RECEIVED to audit
+  ▼
+Workflow Engine
+  │  ← reads stages from workflow config
+  │
+  ├── [Validation Stage]
+  │     checks required fields, types
+  │     → transitions to EVALUATING on pass
+  │
+  ├── [External Call Stage]
+  │     calls credit_bureau / identity_check with retry
+  │     exponential backoff: 200ms → 400ms → 800ms
+  │
+  ├── [Rule Evaluation Stage]
+  │     runs each rule through Rule Engine
+  │     logs RULE_EVALUATED for every single rule
+  │
+  └── [Decision Stage]
+        Decision Maker collects all stage outcomes
+        priority: REJECTED > MANUAL_REVIEW > APPROVED
+  │
+  ▼
+State Machine
+  │  DECIDED → COMPLETED or MANUAL_REVIEW
+  ▼
+Response to client (with explanation)
 ```
 
-## State Machine Diagram
+---
 
+## Modules
+
+### `main.py`
+FastAPI app. All routes are here. Handles idempotency (in-memory dict), request logging middleware, and wires up all the other modules on startup.
+
+### `engine/workflow_engine.py`
+The main orchestrator. Takes `(request_id, workflow_id, input_data)` and runs all stages in sequence. If any required stage fails, it stops and marks the request as FAILED. Uses dependency injection — gets config_loader, state_machine, audit_logger from constructor.
+
+### `engine/rule_engine.py`
+Evaluates a list of rules against input data. Has a dict of 12 operators (each is a small lambda). For every rule, produces a human-readable reasoning string like "✓ credit_score is 780, meets minimum of 750 → APPROVED". Mandatory rules halt evaluation early if they fail.
+
+### `engine/decision_maker.py`
+Gets all stage results and resolves the final outcome. Priority: REJECTED > MANUAL_REVIEW > APPROVED. Also builds the full text decision report.
+
+### `state/__init__.py`
+State machine with hardcoded valid transitions. Throws an error for invalid transitions. Every transition is persisted to `state_history` table.
+
+Valid transitions:
 ```
-RECEIVED → VALIDATING → EVALUATING → DECIDED → COMPLETED
-              │              │           │
-              ▼              ▼           ▼
-            FAILED ←──── RETRYING   MANUAL_REVIEW
+RECEIVED → VALIDATING
+VALIDATING → EVALUATING or FAILED
+EVALUATING → DECIDED, FAILED, or RETRYING
+DECIDED → COMPLETED or MANUAL_REVIEW
+FAILED → RETRYING
 ```
 
-- Terminal states: COMPLETED, MANUAL_REVIEW, FAILED
-- FAILED can transition to RETRYING (for future retry support)
+### `audit/__init__.py`
+Logs everything. Every rule eval, every state change, every external call, every decision — goes into the `audit_logs` table with JSON snapshots of inputs and outputs.
 
-## Recovery Mechanism
+### `external/__init__.py`
+Simulates 4 external services (credit bureau, document verification, identity check, compliance). Each has a configurable failure rate and latency. The `call_with_retry()` method does exponential backoff retries automatically.
 
-On server startup, `recover_stale_requests()` runs automatically:
-1. Finds requests in non-terminal states with `updated_at` older than 5 minutes
-2. Marks them as FAILED with a recovery explanation
-3. Logs a RECOVERY audit event
+### `config/config_loader.py`
+Loads workflows in two passes:
+1. Reads all `.json` files from `config/workflows/` at startup
+2. Loads any workflows saved to the `workflows` DB table (these come from `POST /api/workflows`)
 
-This handles the case where the server crashed mid-processing — the request was saved to DB but never reached a terminal state.
+When you register a new workflow via API, it's saved to both memory and DB — so it survives server restarts.
+
+### `db/database.py`
+Async SQLite using aiosqlite. Runs migrations on every startup (CREATE TABLE IF NOT EXISTS). Includes `recover_stale_requests()` which finds stuck requests and either retries them or marks them FAILED.
+
+---
+
+## Database Tables
+
+| Table | What it stores |
+|-------|----------------|
+| `requests` | Every incoming request — id, workflow_id, input data, status, outcome |
+| `state_history` | Every state transition with from/to/reason and timestamp |
+| `audit_logs` | Every event: rules, external calls, errors, decisions — with JSON snapshots |
+| `workflows` | Workflow configs registered via API (persisted so they survive restarts) |
+| `idempotency_keys` | Reserved for future DB-backed idempotency (currently in-memory) |
+
+---
+
+## Recovery
+
+On every server startup, recovery runs automatically:
+
+1. Finds all requests stuck in non-terminal states (`RECEIVED`, `VALIDATING`, `EVALUATING`, `RETRYING`) older than 5 minutes
+2. Resets them to `RECEIVED` and re-processes through the workflow engine
+3. Logs `RECOVERY_RETRY` event in audit trail
+
+You can also trigger recovery manually via `POST /api/recover`:
+- `"retry": true` — re-processes the request (gets a real outcome)
+- `"retry": false` — just stamps as FAILED
+
+The reason I chose retry-from-scratch over resume-from-stage is simplicity — resuming requires tracking which stages completed, which adds complexity. Re-running is cleaner and guarantees consistent state.
+
+---
+
+## Why SQLite
+
+No setup, no separate process, zero config. For a hackathon with moderate load, it works fine. The repository pattern in `db/database.py` means swapping to Postgres later is a small change — just replace `aiosqlite` with `asyncpg` and fix datetime functions.
